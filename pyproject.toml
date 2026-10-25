@@ -1,0 +1,17 @@
+[project]
+name = "upgrade-dino"
+version = "0.1.0"
+description = "DINO ViT-S/16 on CIFAR-100: standard vs numerically fixed cross-entropy (Barron 2026) x teacher temperature"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    # PyPI torch 2.9.x linux wheels are CUDA 12.8 builds (needs NVIDIA driver >= 570)
+    "torch==2.9.1",
+    "torchvision==0.24.1",
+    "timm>=1.0.15,<1.1",
+    "numpy>=1.26",
+    "pillow>=10",
+    "matplotlib>=3.8",
+]
+
+[tool.uv]
+package = false
