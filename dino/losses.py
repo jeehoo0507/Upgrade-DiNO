@@ -87,17 +87,22 @@ def reference_grad(zs, zt):
     return _soft_grad(zs, zt, logp, logp.exp(), fixed_log_softmax(zs).exp())
 
 
+def _rel(g, ref):
+    return ((g - ref).norm(dim=-1) / ref.norm(dim=-1).clamp_min(1e-300)).cpu()
+
+
 def grad_rel_error(zs, zt, impl, dtype=torch.float32):
-    """Per-sample relative L2 error of dL/dz_S computed by `impl` in `dtype`, vs the float64 reference.
-    Returns (rel_err (B,), |sum_k g_k| (B,)) as float64 CPU tensors."""
-    ref = reference_grad(zs, zt)
-    x = zs.detach().to(dtype).requires_grad_(True)
+    """Per-sample relative L2 error of dL/dz_S computed by `impl` in `dtype`. Returns float64 CPU tensors:
+      ce_err   vs the float64 gradient AT THE SAME (dtype-rounded) INPUTS -> error of the CE computation alone
+      e2e_err  vs the float64 gradient at the original inputs -> also includes rounding the logits to dtype
+      sum_abs  |sum_k g_k| (exact gradient sums to 0)
+    For float32 inputs (the training logits) the two coincide."""
+    xs, xt = zs.detach().to(dtype), zt.detach().to(dtype)
+    x = xs.clone().requires_grad_(True)
     with torch.enable_grad():
-        loss = soft_ce(x, zt.detach().to(dtype), impl).sum()
-        (g,) = torch.autograd.grad(loss, x)
+        (g,) = torch.autograd.grad(soft_ce(x, xt, impl).sum(), x)
     g = g.double()
-    err = (g - ref).norm(dim=-1) / ref.norm(dim=-1).clamp_min(1e-300)
-    return err.cpu(), g.sum(-1).abs().cpu()
+    return _rel(g, reference_grad(xs, xt)), _rel(g, reference_grad(zs, zt)), g.sum(-1).abs().cpu()
 
 
 # -------------------------------------------------------------------------------------- DINO loss ---
@@ -118,7 +123,7 @@ class DINOLoss(nn.Module):
     def logits(self, student_output, teacher_output, epoch):
         temp = self.teacher_temp_schedule[epoch]
         zs = (student_output / self.student_temp).chunk(self.ncrops)
-        zt = ((teacher_output - self.center) / temp).detach().chunk(2)
+        zt = ((teacher_output - self.center.to(teacher_output.dtype)) / temp).detach().chunk(2)
         return zs, zt
 
     def forward(self, student_output, teacher_output, epoch):
@@ -134,10 +139,14 @@ class DINOLoss(nn.Module):
             p = F.softmax(zt[0].float(), dim=-1)
             self.last = {"teacher_entropy": float(-(p * p.clamp_min(1e-30).log()).sum(-1).mean()),
                          "teacher_maxprob": float(p.max(-1).values.mean())}
-        self.update_center(teacher_output)
         return total / n
 
     @torch.no_grad()
     def update_center(self, teacher_output):
-        batch_center = teacher_output.mean(0, keepdim=True)        # single GPU (no all_reduce)
+        """Called by the training loop after the step (DINO updates it right after the loss). Skipped for a
+        non-finite teacher output so one bad batch cannot poison the running center."""
+        if not torch.isfinite(teacher_output).all():
+            return False
+        batch_center = teacher_output.float().mean(0, keepdim=True)    # single GPU (no all_reduce); fp32 buffer
         self.center.mul_(self.center_momentum).add_(batch_center, alpha=1 - self.center_momentum)
+        return True

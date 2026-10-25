@@ -29,11 +29,12 @@ from dino.knn import extract, feature_stats, knn_classifier
 from dino.losses import LOSSES, DINOLoss, grad_rel_error
 from dino.model import DINOHead, MultiCropWrapper, build_backbone
 
-STEP_FIELDS = ["it", "epoch", "loss", "finite", "skipped", "grad_norm", "lr", "wd", "momentum", "scale",
+STEP_FIELDS = ["it", "epoch", "loss", "finite", "skipped", "ema", "center", "grad_norm", "lr", "wd", "momentum", "scale",
                "teacher_entropy", "teacher_maxprob", "t_feat_std"]
-GERR_FIELDS = ["it", "epoch", "impl", "dtype", "rel_err_median", "rel_err_mean", "rel_err_max", "sum_abs_median"]
+GERR_FIELDS = ["it", "epoch", "impl", "dtype", "rel_err_median", "rel_err_mean", "rel_err_max",
+               "e2e_err_median", "sum_abs_median"]
 LOG_FIELDS = ["epoch", "loss_mean", "loss_std", "loss_max", "n_nonfinite", "n_skipped", "teacher_entropy",
-              "t_feat_std", "epoch_time_s"]
+              "t_feat_std", "epoch_time_s", "max_mem_gb"]
 KNN_FIELDS = ["epoch", "knn_top1", "knn_top5", "feat_std", "mean_cos"]
 
 
@@ -63,6 +64,10 @@ def parse_args(argv=None):
     ap.add_argument("--warmup-teacher-temp-epochs", type=int, default=0,
                     help="0 = constant teacher temperature (the variable of this study)")
     ap.add_argument("--center-momentum", type=float, default=0.9)
+    ap.add_argument("--loss-dtype", choices=("fp32", "bf16"), default="fp32",
+                    help="precision of the DINO loss / cross-entropy. fp32 = DINO default (this study's main runs); "
+                         "bf16 = follow-up where CE rounding error is large (standard CE ~470%% vs fixed ~0.7%% "
+                         "relative gradient error near agreement in the unit test)")
     ap.add_argument("--global-size", type=int, default=224)
     ap.add_argument("--local-size", type=int, default=96)
     ap.add_argument("--local-crops", type=int, default=6)
@@ -78,6 +83,8 @@ def parse_args(argv=None):
     ap.add_argument("--grad-err-rows", type=int, default=32, help="samples per gradient-error measurement")
     ap.add_argument("--limit", type=int, default=None, help="[smoke] train images")
     ap.add_argument("--knn-limit", type=int, default=None, help="[smoke] images per k-NN split")
+    ap.add_argument("--stop-after-epoch", type=int, default=None,
+                    help="[smoke] exit after saving this epoch's checkpoint (tests exact resume)")
     return ap.parse_args(argv)
 
 
@@ -172,7 +179,7 @@ def main(argv=None):
     cfg_path = out / "config.json"
     if cfg_path.exists():
         old = json.loads(cfg_path.read_text())
-        diff = {k: (old.get(k), cfg.get(k)) for k in set(old) | set(cfg) if k not in ("num_workers",)
+        diff = {k: (old.get(k), cfg.get(k)) for k in set(old) | set(cfg) if k not in ("num_workers", "stop_after_epoch")
                 and old.get(k) != cfg.get(k)}
         if diff:
             sys.exit(f"[error] {out} holds a run with different settings: {diff}")
@@ -195,6 +202,7 @@ def main(argv=None):
     student, teacher = student.to(device), teacher.to(device)
     for p in teacher.parameters():
         p.requires_grad = False
+    teacher.eval()                      # no dropout / BN in ViT-S, so this only documents intent
     ncrops = 2 + args.local_crops
     crit = DINOLoss(args.out_dim, ncrops, args.loss, args.teacher_temp, args.student_temp, args.center_momentum,
                     args.warmup_teacher_temp, args.warmup_teacher_temp_epochs, args.epochs).to(device)
@@ -221,6 +229,11 @@ def main(argv=None):
     print(f"device {device} amp {amp} | loss {args.loss} teacher_temp {args.teacher_temp} | train {len(train_ds)} "
           f"x {ncrops} crops, {niter} it/epoch, {args.epochs} epochs", flush=True)
     for epoch in range(start_epoch, args.epochs):
+        # Every RNG is re-seeded from (seed, epoch) at the epoch start, so a run resumed at an epoch boundary
+        # continues exactly as the uninterrupted run (data order, worker augmentation, drop path, k-NN loaders).
+        seed_all(args.seed * 1000 + epoch)
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats()
         gen = torch.Generator().manual_seed(args.seed * 1000 + epoch)     # same data order in every run
         loader = torch.utils.data.DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, generator=gen,
                                              num_workers=args.num_workers, pin_memory=device.type == "cuda",
@@ -237,18 +250,20 @@ def main(argv=None):
             with torch.autocast(device.type, dtype=torch.float16, enabled=amp):
                 t_feat, t_out = teacher(images[:2], return_backbone=True)
                 s_out = student(images)
-            s_out, t_out = s_out.float(), t_out.float()          # loss always in float32
+            ldt = torch.float32 if args.loss_dtype == "fp32" else torch.bfloat16
+            s_out, t_out = s_out.to(ldt), t_out.to(ldt)          # loss precision: fp32 (default) or bf16
             if args.grad_err_every and it % args.grad_err_every == 0:
                 with torch.no_grad():
-                    zs, zt = crit.logits(s_out.detach(), t_out.detach(), epoch)
+                    zs, zt = crit.logits(s_out.detach().float(), t_out.detach().float(), epoch)
                     zs1, zt0 = zs[1][: args.grad_err_rows], zt[0][: args.grad_err_rows]   # student view 1 vs teacher view 0
                 for impl in LOSSES:
                     for dt, dn in ((torch.float32, "fp32"), (torch.bfloat16, "bf16")):
-                        e, sabs = grad_rel_error(zs1, zt0, impl, dt)
+                        e, e2e, sabs = grad_rel_error(zs1, zt0, impl, dt)
                         gerrs.append({"it": it, "epoch": epoch, "impl": impl, "dtype": dn,
                                       "rel_err_median": f"{e.median():.4e}", "rel_err_mean": f"{e.mean():.4e}",
-                                      "rel_err_max": f"{e.max():.4e}", "sum_abs_median": f"{sabs.median():.4e}"})
-            loss = crit(s_out, t_out, epoch)
+                                      "rel_err_max": f"{e.max():.4e}", "e2e_err_median": f"{e2e.median():.4e}",
+                                      "sum_abs_median": f"{sabs.median():.4e}"})
+            loss = crit(s_out, t_out, epoch).float()
             finite = bool(torch.isfinite(loss))
             opt.zero_grad(set_to_none=True)
             gnorm, skipped = float("nan"), 0
@@ -266,14 +281,17 @@ def main(argv=None):
                 skipped = int(amp and scaler.get_scale() < scale_before)    # fp16 overflow -> step skipped
             else:
                 skipped = 1
-            with torch.no_grad():                                           # EMA teacher
-                m = mom_s[it]
-                for ps, pt in zip(student.parameters(), teacher.parameters()):
-                    pt.data.mul_(m).add_((1 - m) * ps.detach().data)
+            stepped = finite and not skipped
+            with torch.no_grad():
+                if stepped:            # EMA only after a real optimizer step (no teacher drift on failed steps)
+                    m = mom_s[it]
+                    for ps, pt in zip(student.parameters(), teacher.parameters()):
+                        pt.data.mul_(m).add_((1 - m) * ps.detach().data)
+                centered = crit.update_center(t_out)        # teacher is unchanged by a failed step: still valid
                 tf = torch.nn.functional.normalize(t_feat.float(), dim=-1)
                 t_std = float(tf.std(0).mean() * math.sqrt(tf.shape[1]))
             steps.append({"it": it, "epoch": epoch, "loss": f"{float(loss):.6f}", "finite": int(finite),
-                          "skipped": skipped, "grad_norm": f"{gnorm:.4f}", "lr": f"{lr_s[it]:.3e}",
+                          "skipped": skipped, "ema": int(stepped), "center": int(centered), "grad_norm": f"{gnorm:.4f}", "lr": f"{lr_s[it]:.3e}",
                           "wd": f"{wd_s[it]:.4f}", "momentum": f"{mom_s[it]:.6f}",
                           "scale": f"{scaler.get_scale() if amp else 1.0:.0f}",
                           "teacher_entropy": f"{crit.last['teacher_entropy']:.4f}",
@@ -291,7 +309,8 @@ def main(argv=None):
             "loss_max": f"{losses.max():.5f}" if len(losses) else "nan",
             "n_nonfinite": sum(1 - s["finite"] for s in steps), "n_skipped": sum(s["skipped"] for s in steps),
             "teacher_entropy": f"{np.mean([float(s['teacher_entropy']) for s in steps]):.4f}",
-            "t_feat_std": f"{np.mean([float(s['t_feat_std']) for s in steps]):.4f}", "epoch_time_s": f"{dt_ep:.1f}"}])
+            "t_feat_std": f"{np.mean([float(s['t_feat_std']) for s in steps]):.4f}", "epoch_time_s": f"{dt_ep:.1f}",
+            "max_mem_gb": f"{torch.cuda.max_memory_allocated() / 2**30:.2f}" if device.type == "cuda" else "0"}])
         last = epoch + 1 == args.epochs
         if last or (args.eval_every and (epoch + 1) % args.eval_every == 0):
             r = knn_eval(teacher, args, device, amp)
@@ -302,7 +321,12 @@ def main(argv=None):
                     "scaler": scaler.state_dict(), "crit": crit.state_dict(), "epoch": epoch},
                    str(ck_path) + ".tmp")
         os.replace(str(ck_path) + ".tmp", ck_path)
-        print(f"epoch {epoch} done in {dt_ep:.0f}s (ETA {dt_ep * (args.epochs - epoch - 1) / 3600:.1f} h)", flush=True)
+        mem = f", peak GPU mem {torch.cuda.max_memory_allocated() / 2**30:.1f} GB" if device.type == "cuda" else ""
+        print(f"epoch {epoch} done in {dt_ep:.0f}s (ETA {dt_ep * (args.epochs - epoch - 1) / 3600:.1f} h){mem}",
+              flush=True)
+        if args.stop_after_epoch is not None and epoch == args.stop_after_epoch:
+            print(f"stop after epoch {epoch} (--stop-after-epoch)")
+            return
     if "r" not in locals():            # resumed after the last epoch had already been saved
         r = knn_eval(teacher, args, device, amp)
     torch.save({"teacher_backbone": teacher.backbone.state_dict(), "config": cfg}, out / "teacher_backbone.pt")

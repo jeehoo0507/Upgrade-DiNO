@@ -45,14 +45,26 @@ for s in "## 1. 결과표" "## 2. Gradient" "## 3. Temperature" "## 4. 판정" "
   grep -qF "$s" "$S" || { echo "FAIL summary lacks: $s"; exit 1; }
 done
 test -s "$RESULTS_DIR/summary.png"
-echo "################ 4. resume ################"
-rm "$OUTPUT_ROOT/t0.04_fixed/DONE"
+echo "################ 4. exact resume ################"
+R=$SM/resume_run
+uv run python -m dino.train --loss fixed --teacher-temp 0.04 --epochs 2 --out "$R" $EXTRA --stop-after-epoch 0 > "$SM/resume1.log" 2>&1
+test ! -f "$R/DONE"
+uv run python -m dino.train --loss fixed --teacher-temp 0.04 --epochs 2 --out "$R" $EXTRA > "$SM/resume2.log" 2>&1
+grep -q "resuming from .* at epoch 1" "$SM/resume2.log" && test -f "$R/DONE"
 uv run python - <<PY
-import torch; p = "$OUTPUT_ROOT/t0.04_fixed/checkpoint.pt"; ck = torch.load(p, weights_only=False); ck["epoch"] = 0; torch.save(ck, p)
+import csv, json
+a = list(csv.DictReader(open("$R/steps.csv")))
+b = list(csv.DictReader(open("$OUTPUT_ROOT/t0.04_fixed/steps.csv")))
+assert [int(x["it"]) for x in a] == list(range(8)), "steps.csv duplicated or missing rows"
+assert [x["loss"] for x in a] == [x["loss"] for x in b], ([x["loss"] for x in a], [x["loss"] for x in b])
+assert json.load(open("$R/final.json")) == json.load(open("$OUTPUT_ROOT/t0.04_fixed/final.json"))
+assert all(x["ema"] == "1" and x["center"] == "1" for x in a)       # every toy step stepped (no fp16 on CPU)
+g = list(csv.DictReader(open("$R/graderr.csv")))
+assert all(x["e2e_err_median"] for x in g) and all(x["rel_err_median"] == x["e2e_err_median"] for x in g if x["dtype"] == "fp32")
+print("  ok   stopped after epoch 0, resumed: every loss and the final k-NN identical to the uninterrupted run")
 PY
-uv run python -m dino.train --loss fixed --teacher-temp 0.04 --epochs 2 --out "$OUTPUT_ROOT/t0.04_fixed" $EXTRA \
-  > "$SM/resume.log" 2>&1
-grep -q "resuming from .* at epoch 1" "$SM/resume.log" && test -f "$OUTPUT_ROOT/t0.04_fixed/DONE"
-uv run python -c "import csv; s=list(csv.DictReader(open('$OUTPUT_ROOT/t0.04_fixed/steps.csv'))); assert [int(x['it']) for x in s]==list(range(8)), [x['it'] for x in s]"
-echo "  ok   resume from epoch 1, steps.csv not duplicated"
+echo "################ 5. bf16 loss option (1 epoch) ################"
+uv run python -m dino.train --loss fixed --teacher-temp 0.04 --epochs 1 --out "$SM/bf16_run" $EXTRA --loss-dtype bf16 \
+  > "$SM/bf16.log" 2>&1 && test -f "$SM/bf16_run/DONE"
+echo "  ok   --loss-dtype bf16 trains and evaluates"
 echo; echo "SMOKE OK in $(( $(date +%s) - T0 )) s. Summary: $S"

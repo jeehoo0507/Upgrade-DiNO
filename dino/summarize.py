@@ -64,6 +64,8 @@ def run_stats(d):
         for dt in ("fp32", "bf16"):
             v = [float(g["rel_err_median"]) for g in gerr if g["impl"] == impl and g["dtype"] == dt]
             r[f"gerr_{impl}_{dt}"] = float(np.median(v)) if v else float("nan")
+            v2 = [float(g["e2e_err_median"]) for g in gerr if g["impl"] == impl and g["dtype"] == dt and "e2e_err_median" in g]
+            r[f"e2e_{impl}_{dt}"] = float(np.median(v2)) if v2 else float("nan")
             r[f"gerr_curve_{impl}_{dt}"] = [(int(g["it"]), float(g["rel_err_median"])) for g in gerr
                                             if g["impl"] == impl and g["dtype"] == dt]
     return r
@@ -100,13 +102,17 @@ def main():
                   f"{r['n_nonfinite']} / {r['n_skipped']} | {f(r['late_loss_std'], 4)} | {f(r.get('feat_std'), 3)} | "
                   f"{f(r.get('mean_cos'), 3)} | {f(r['teacher_entropy'], 2)} |")
     md += ["", "## 2. Gradient 상대 오차 (float64 기준, 학습 중 측정값의 중앙값)", "",
-           "각 run의 실제 logit으로 두 구현을 모두 측정 (student view 1 vs teacher view 0).", "",
-           "| run | standard fp32 | fixed fp32 | standard bf16 | fixed bf16 |", "|---|---|---|---|---|"]
+           "각 run의 실제 logit으로 두 구현을 모두 측정 (student view 1 vs teacher view 0). "
+           "**CE 오차** = 같은 입력(그 정밀도로 반올림된 logit)에서의 float64 gradient 대비 → CE 계산 자체의 오차. "
+           "bf16 **입력 포함** = 원래 fp32 logit 기준 → logit을 bf16으로 반올림한 손실까지 포함 (참고용).", "",
+           "| run | standard fp32 | fixed fp32 | standard bf16 | fixed bf16 | standard bf16 (입력 포함) | fixed bf16 (입력 포함) |",
+           "|---|---|---|---|---|---|---|"]
     for name, _, _ in RUNS:
         r = S[name]
         if r:
             md.append(f"| {name} | {e(r['gerr_standard_fp32'])} | {e(r['gerr_fixed_fp32'])} | "
-                      f"{e(r['gerr_standard_bf16'])} | {e(r['gerr_fixed_bf16'])} |")
+                      f"{e(r['gerr_standard_bf16'])} | {e(r['gerr_fixed_bf16'])} | "
+                      f"{e(r['e2e_standard_bf16'])} | {e(r['e2e_fixed_bf16'])} |")
     md += ["", "## 3. Temperature 민감도 (τ_t 0.10 − 0.04, 최종 k-NN)", ""]
     for impl in ("standard", "fixed"):
         a4, a10 = S[f"t0.04_{impl}"], S[f"t0.1_{impl}"]
@@ -125,7 +131,10 @@ def main():
         md.append(f"- τ_t {tt}: Fixed − Standard k-NN {dk:+.2f}%p, spike {s_['n_spikes']} → {x_['n_spikes']}, "
                   f"grad 오차(fp32) {e(s_['gerr_standard_fp32'])} → {e(x_['gerr_fixed_fp32'])} → "
                   + ("**후속 실험 가치 있음 (seed·temperature 확장)**" if go else "차이 없음"))
-    md += ["", "그림: `summary.png` (loss 곡선과 spike, k-NN 곡선, gradient 오차)", ""]
+    md += ["", "해석 주의: Fixed CE에서 gradient 오차와 spike가 함께 줄어도 'DINO 불안정성이 수치 오류 때문'이라는 인과는 "
+           "이 실험만으로 확정할 수 없다. 특히 τ_t 0.10의 불안정은 teacher 분포가 균일해지는 것(teacher entropy↑)이 "
+           "원인일 수 있으므로 표 1의 teacher entropy와 함께 본다.", "",
+           "그림: `summary.png` (loss 곡선과 spike, k-NN 곡선, gradient 오차)", ""]
     (res / "summary.md").write_text("\n".join(md) + "\n")
     plot(S, res / "summary.png")
     print("\n".join(md))

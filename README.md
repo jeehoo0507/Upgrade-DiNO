@@ -25,7 +25,7 @@ setsid nohup bash -c 'cd ~/upgrade-dino && ./smoke_test.sh && ./scripts/run_all.
 tail -f $HOME/dino.log            # Ctrl+C는 보기만 멈춤
 cat results/summary.md            # 결과 (중간에도: uv run python -m dino.summarize)
 ```
-- `smoke_test.sh`: loss 단위 테스트 → 가짜 CIFAR로 4 run × 2에포치 → 요약 → 재개 확인 (CPU로 3분 안팎). 끝에 `SMOKE OK`.
+- `smoke_test.sh`: loss 단위 테스트 → 가짜 CIFAR로 4 run × 2에포치 → 요약 → 정확한 재개 확인 → bf16 loss 옵션 (CPU로 3분 안팎). 끝에 `SMOKE OK`.
 - 다시 실행하면 끝난 run(`DONE`)은 건너뛰고, 중단된 run은 `checkpoint.pt`에서 이어간다.
 - 시간: run 하나 대략 3~5시간 (A5000, batch 64, 2 global 224 + 6 local 96 crop), 4 run 순차로 하루 안팎.
   첫 run 로그의 `epoch N done in Xs (ETA ...)`로 실제 시간을 확인할 것.
@@ -48,7 +48,7 @@ DINO loss는 soft target CE다: `L = −Σ p log q`, `p = softmax((t − c)/τ_t
 두 경로 모두 실수 연산에서는 같은 값이며, 단위 테스트에서 float64 기준과 비교했다.
 단위 테스트 기준 fp32, teacher–student 근접 시 gradient 상대 오차: standard 3.0e-4 → fixed 9.3e-8.
 
-- loss는 두 경우 모두 **float32**로 계산한다 (네트워크 forward만 fp16 autocast, DINO와 같음).
+- loss는 두 경우 모두 **float32**로 계산한다 (네트워크 forward만 fp16 autocast, DINO와 같음; `--loss-dtype bf16`으로 변경 가능).
   따라서 두 run의 차이는 CE를 어떻게 계산하느냐 하나뿐이다.
 
 ## 지표 (`results/summary.md`, `summary.png`)
@@ -73,7 +73,24 @@ weight decay 0.04 → 0.4, teacher momentum 0.996 → 1, student temperature 0.1
 마지막 층 1에포치 고정, **teacher temperature 고정 (warmup 없음)**. CIFAR 32×32 이미지는 crop할 때 224/96으로 확대한다.
 바꾸려면 `EXTRA="--local-crops 10 --batch-size 128" ./scripts/run_all.sh`처럼 넘기면 4 run에 똑같이 적용된다.
 
+## 검수 반영 (외부 코드 리뷰)
+
+| 지적 | 판단 | 반영 |
+|---|---|---|
+| ① 실패한 step에서도 EMA teacher가 움직임 | 맞음 | optimizer step이 실제로 된 경우(loss 유한 + fp16 overflow skip 아님)에만 EMA. center는 손실 계산 밖으로 빼서 step 뒤에 갱신하고, teacher 출력이 비유한이면 건너뜀. `steps.csv`의 `ema`, `center` 열로 확인. (DINO 원본은 fp16 skip step에도 EMA를 함 → 작은 차이로 명시) |
+| ② bf16 gradient 오차에 logit 반올림 손실이 섞임 | 맞음 | `rel_err_*` = **같은 (반올림된) 입력에서의 float64 gradient 대비 = CE 계산 자체의 오차**, `e2e_err_median` = 원래 fp32 logit 대비 (참고). 단위 테스트에서 bf16·근접 시 CE 오차 standard 473% vs fixed 0.68%. 입력 반올림(~0.03)이 teacher–student 차이보다 크면 두 값이 크게 달라서 분리가 필요함을 확인 |
+| ③ 재개 시 RNG 미복원 | 맞음 | 매 에포치 시작에 모든 RNG를 (seed, epoch)로 다시 시드 → 에포치 경계에서 재개하면 중단 없는 run과 **완전히 같음**. smoke에서 "에포치 0 후 중단 → 재개"가 모든 step loss와 최종 k-NN까지 일치하는지 검사 |
+| ④ τ 0.10의 실패를 수치 오류로 단정 못 함 | 맞음 | summary에 teacher entropy를 같이 두고 해석 주의 문구 추가. 후속 후보: τ_t 0.02 (`EXTRA` 대신 `dino.train --teacher-temp 0.02`) |
+| A5000 1 epoch VRAM 확인 | 반영 | 매 에포치 peak GPU 메모리를 로그(`epoch N done ... peak GPU mem`)와 `log.csv`의 `max_mem_gb`에 기록. OOM이면 `EXTRA="--batch-size 32"` |
+
 ## 해석할 때 주의
+
+- **fp32 loss에서는 효과가 작을 수 있다 (중요).** DINO head 출력은 정규화된 벡터의 코사인 값(−1~1)이고 fp16으로 계산된다.
+  그래서 logit 자체에 이미 ~5e-4 수준의 반올림 잡음이 있다. fp32 CE의 계산 오차(~1e-7, teacher–student 근접 시 ~3e-4)는
+  대부분 이보다 작다. 4개 run에서 차이가 없으면 "DINO에서는 수치 오류가 중요하지 않다"가 아니라
+  "fp32 loss에서는 오차가 작다"까지만 말할 수 있다. 오차가 큰 조건을 보려면 후속으로 **loss를 bf16으로 계산**한다:
+  `EXTRA="--loss-dtype bf16" OUTPUT_ROOT=$HOME/dino/outputs_bf16 ./scripts/run_all.sh`
+- 인과: Fixed CE에서 gradient 오차와 spike가 함께 줄어도, DINO 불안정성이 수치 오류 **때문**이라고 확정할 수는 없다.
 
 - seed 1개라 차이가 작으면 노이즈일 수 있다. 판단 규칙을 넘으면 seed를 늘려 재현성부터 확인한다.
 - Fixed CE의 이점은 논문 기준으로 **teacher와 student가 가까울 때**(뺄셈 상쇄)와 **logit 차이가 아주 클 때**에 나온다.
