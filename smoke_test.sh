@@ -56,12 +56,20 @@ import csv, json
 a = list(csv.DictReader(open("$R/steps.csv")))
 b = list(csv.DictReader(open("$OUTPUT_ROOT/t0.04_fixed/steps.csv")))
 assert [int(x["it"]) for x in a] == list(range(8)), "steps.csv duplicated or missing rows"
-assert [x["loss"] for x in a] == [x["loss"] for x in b], ([x["loss"] for x in a], [x["loss"] for x in b])
-assert json.load(open("$R/final.json")) == json.load(open("$OUTPUT_ROOT/t0.04_fixed/final.json"))
+la, lb = [float(x["loss"]) for x in a], [float(x["loss"]) for x in b]
+fa, fb = json.load(open("$R/final.json")), json.load(open("$OUTPUT_ROOT/t0.04_fixed/final.json"))
+if "$GPUS" == "cpu":      # CPU is deterministic: the resumed run must be bit-identical
+    assert la == lb, (la, lb)
+    assert fa == fb, (fa, fb)
+else:                     # GPU kernels are not bit-deterministic run to run: same up to rounding noise
+    assert la[:4] == lb[:4], "epoch 0 (before the stop) must match exactly"
+    assert all(abs(x - y) <= 1e-3 * abs(y) for x, y in zip(la, lb)), (la, lb)
+    assert all(abs(fa[k] - fb[k]) <= max(2.5, 0.05 * abs(fb[k])) for k in fb), (fa, fb)
 assert all(x["ema"] == "1" and x["center"] == "1" for x in a)       # every toy step stepped (no fp16 on CPU)
 g = list(csv.DictReader(open("$R/graderr.csv")))
 assert all(x["e2e_err_median"] for x in g) and all(x["rel_err_median"] == x["e2e_err_median"] for x in g if x["dtype"] == "fp32")
-print("  ok   stopped after epoch 0, resumed: every loss and the final k-NN identical to the uninterrupted run")
+print("  ok   stopped after epoch 0, resumed: losses and final k-NN match the uninterrupted run"
+      + (" (bit-identical on CPU)" if "$GPUS" == "cpu" else " (within GPU rounding noise)"))
 PY
 echo "################ 5. bf16 loss option (1 epoch) ################"
 uv run python -m dino.train --loss fixed --teacher-temp 0.04 --epochs 1 --out "$SM/bf16_run" $EXTRA --loss-dtype bf16 \
