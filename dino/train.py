@@ -13,6 +13,7 @@ Rerunning the same command resumes from checkpoint.pt.
 """
 import argparse
 import csv
+import fcntl
 import json
 import math
 import os
@@ -173,6 +174,14 @@ def main(argv=None):
     if (out / "DONE").exists():
         print(f"{out} already finished (DONE)")
         return
+    lock = open(out / "RUNNING.lock", "w")         # one training process per run directory
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit(f"[error] another process is already training {out} (RUNNING.lock held). "
+                 "Stop it first: ./scripts/stop.sh")
+    lock.write(str(os.getpid()))
+    lock.flush()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp = not args.no_amp and device.type == "cuda"
     cfg = {k: (list(v) if isinstance(v, tuple) else v) for k, v in vars(args).items()}

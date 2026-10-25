@@ -71,7 +71,16 @@ assert all(x["e2e_err_median"] for x in g) and all(x["rel_err_median"] == x["e2e
 print("  ok   stopped after epoch 0, resumed: losses and final k-NN match the uninterrupted run"
       + (" (bit-identical on CPU)" if "$GPUS" == "cpu" else " (within GPU rounding noise)"))
 PY
-echo "################ 5. bf16 loss option (1 epoch) ################"
+echo "################ 5. one process per run (lock) ################"
+L=$SM/lock_run; mkdir -p "$L"
+uv run python -c "import fcntl, time; f=open('$L/RUNNING.lock','w'); fcntl.flock(f, fcntl.LOCK_EX); time.sleep(30)" &
+HOLD=$!; sleep 2
+if uv run python -m dino.train --loss fixed --teacher-temp 0.04 --epochs 1 --out "$L" $EXTRA > "$SM/lock.log" 2>&1; then
+  echo "FAIL a second process trained a locked run"; kill $HOLD; exit 1
+fi
+grep -q "already training" "$SM/lock.log"; kill $HOLD 2>/dev/null; wait $HOLD 2>/dev/null || true
+echo "  ok   a second process refuses to train a run that is already being trained"
+echo "################ 6. bf16 loss option (1 epoch) ################"
 uv run python -m dino.train --loss fixed --teacher-temp 0.04 --epochs 1 --out "$SM/bf16_run" $EXTRA --loss-dtype bf16 \
   > "$SM/bf16.log" 2>&1 && test -f "$SM/bf16_run/DONE"
 echo "  ok   --loss-dtype bf16 trains and evaluates"

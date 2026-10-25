@@ -27,6 +27,9 @@ cat results/summary.md            # 결과 (중간에도: uv run python -m dino.
 ```
 - `smoke_test.sh`: loss 단위 테스트 → 가짜 CIFAR로 4 run × 2에포치 → 요약 → 정확한 재개 확인 → bf16 loss 옵션 (CPU로 3분 안팎). 끝에 `SMOKE OK`.
 - 다시 실행하면 끝난 run(`DONE`)은 건너뛰고, 중단된 run은 `checkpoint.pt`에서 이어간다.
+- **멈출 때는 반드시 `./scripts/stop.sh`.** `pkill -f run_all.sh`만 하면 내부 반복(xargs)이 살아남아 다음 run을 계속 띄운다.
+  한 run 폴더는 `RUNNING.lock`으로 한 프로세스만 학습할 수 있다.
+- 동시 실행: GPU 사용률이 낮으면(데이터 증강이 CPU 병목) `P=2 ./scripts/run_all.sh` (run당 GPU 메모리 ~8.5 GB, A5000에 2개).
 - 시간: run 하나 대략 3~5시간 (A5000, batch 64, 2 global 224 + 6 local 96 crop), 4 run 순차로 하루 안팎.
   첫 run 로그의 `epoch N done in Xs (ETA ...)`로 실제 시간을 확인할 것.
 
