@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Stop every Upgrade-DINO process: run_all.sh, its xargs worker loop, the per-run bash shells and dino.train.
+# Stop every Upgrade-DINO process: run_all.sh / run_phase2.sh, their xargs worker loop, the per-run bash shells and dino.train.
 # (Killing only run_all.sh leaves xargs alive, which then starts the next run.) Finished runs are untouched;
 # an interrupted run resumes from its last checkpoint on the next launch.
 # Patterns are anchored to the start of the command line, so shells / editors that merely mention these names
 # are never matched.
-PATS=("^xargs -P [0-9]+ -L 1 bash -c one" "^bash (\./)?scripts/run_all\.sh|^bash .*/scripts/run_all\.sh"
+PATS=("^xargs -P [0-9]+ -L 1 bash -c one" "^bash (\./)?scripts/run_(all|phase2)\.sh|^bash .*/scripts/run_(all|phase2)\.sh"
       "^bash -c one " "^uv run python -m dino\.(train|summarize)" "python[0-9.]* -m dino\.(train|summarize)")
 for p in "${PATS[@]}"; do pkill -f -- "$p"; done      # xargs first, so no new run is started
 for i in $(seq 1 20); do

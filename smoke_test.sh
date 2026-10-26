@@ -84,4 +84,14 @@ echo "################ 6. bf16 loss option (1 epoch) ################"
 uv run python -m dino.train --loss fixed --teacher-temp 0.04 --epochs 1 --out "$SM/bf16_run" $EXTRA --loss-dtype bf16 \
   > "$SM/bf16.log" 2>&1 && test -f "$SM/bf16_run/DONE"
 echo "  ok   --loss-dtype bf16 trains and evaluates"
+echo "################ 7. phase 2 queue (2 toy runs) + phase-2 summary ################"
+NO_WAIT=1 EPOCHS=1 QUEUE="bf16_t0.04_fixed t0.06_standard" ./scripts/run_phase2.sh > "$SM/phase2.log" 2>&1
+grep -q "phase 2 done (rc=0)" "$SM/phase2.log"
+uv run python -c "import json; c=json.load(open('$OUTPUT_ROOT/bf16_t0.04_fixed/config.json')); assert c['loss_dtype']=='bf16' and c['loss']=='fixed' and c['teacher_temp']==0.04, c; c=json.load(open('$OUTPUT_ROOT/t0.06_standard/config.json')); assert c['loss_dtype']=='fp32' and c['teacher_temp']==0.06, c"
+P2=$RESULTS_DIR/summary_phase2.md
+for s in "## 1. 전체 결과" "## 2. Q1 붕괴 경계" "Q1 붕괴 경계" "Q2 bf16 loss (τ 0.04)" "| bf16_t0.04_fixed | bf16 |" "| t0.06_standard | fp32 |"; do
+  grep -qF "$s" "$P2" || { echo "FAIL phase-2 summary lacks: $s"; exit 1; }
+done
+test -s "$RESULTS_DIR/summary_phase2.png"
+echo "  ok   phase-2 run names -> (tau, CE, loss dtype), queue, summary_phase2.md/png"
 echo; echo "SMOKE OK in $(( $(date +%s) - T0 )) s. Summary: $S"
